@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Species in Nature Reserves</title>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1a1a1a; --muted:#6b6b6b; --accent:#2e7d32; --border:#d8d8d4; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:var(--fg); background:var(--bg); }
+  header { padding:16px 20px; border-bottom:1px solid var(--border); background:#fff; }
+  h1 { margin:0; font-size:18px; font-weight:600; }
+  p.sub { margin:4px 0 0; color:var(--muted); font-size:13px; }
+  form { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; padding:16px 20px; background:#fff; border-bottom:1px solid var(--border); }
+  .field { position:relative; display:flex; flex-direction:column; gap:4px; }
+  .field label { font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
+  input, button { font:inherit; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:#fff; }
+  input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  #taxon { width:280px; }
+  #country { width:90px; text-transform:uppercase; }
+  #country:disabled { background:#f0f0ee; color:var(--muted); }
+  select { font:inherit; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:#fff; }
+  button { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .suggestions { position:absolute; top:100%; left:0; right:0; z-index:10; background:#fff; border:1px solid var(--border); border-top:none; border-radius:0 0 6px 6px; max-height:280px; overflow-y:auto; box-shadow:0 4px 12px rgba(0,0,0,.08); }
+  .suggestions:empty { display:none; }
+  .suggestion { padding:8px 10px; cursor:pointer; border-bottom:1px solid #f0f0ee; }
+  .suggestion:last-child { border-bottom:none; }
+  .suggestion:hover, .suggestion.active { background:#eef6ef; }
+  .suggestion i { color:var(--muted); }
+  .selected { font-size:13px; color:var(--accent); padding:0 20px 12px; background:#fff; }
+  .selected:empty { display:none; }
+  #frame { width:100%; height:calc(100vh - 244px); border:none; display:block; }
+  .placeholder { display:flex; align-items:center; justify-content:center; height:calc(100vh - 200px); color:var(--muted); }
+  .toolbar { display:flex; gap:16px; align-items:center; padding:8px 20px; background:#fff; border-bottom:1px solid var(--border); font-size:13px; }
+  .toolbar a { color:var(--accent); text-decoration:none; font-weight:600; }
+  .toolbar a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Species occurrences in nature reserves</h1>
+  <p class="sub">Search for a taxon, pick a country or the whole world, and optionally restrict to protected areas —
+  then explore GBIF occurrences overlaid on OpenStreetMap reserve boundaries.
+  GBIF data is converted to RDF via <a href="https://github.com/Micelio/gbif_parquet" target="_blank" rel="noopener">gbif_parquet</a>
+  and queried live on <a href="https://ui.qlever.dev/gbif" target="_blank" rel="noopener">QLever</a>.
+  Built as a demo for the <a href="https://www.gbif.org/ebbe" target="_blank" rel="noopener">Ebbe Nielsen Challenge 2026</a>.</p>
+</header>
+
+<form id="form" autocomplete="off">
+  <div class="field">
+    <label for="taxon">Taxon (GBIF)</label>
+    <input id="taxon" type="text" placeholder="e.g. Leucaena leucocephala" required>
+    <div id="suggestions" class="suggestions"></div>
+  </div>
+  <div class="field">
+    <label for="areaScope">Area</label>
+    <select id="areaScope">
+      <option value="reserves">Nature reserves only</option>
+      <option value="all">All areas</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="geoScope">Region</label>
+    <select id="geoScope">
+      <option value="country">By country</option>
+      <option value="world">Whole world</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="country">Country code</label>
+    <input id="country" type="text" value="BR" maxlength="2" placeholder="BR" required>
+  </div>
+  <button id="go" type="submit" disabled>Map it</button>
+</form>
+<div id="selected" class="selected"></div>
+
+<div id="result">
+  <div class="placeholder">Select a taxon and country, then “Map it”.</div>
+</div>
+
+<script>
+const GBIF_BACKEND = "https://qlever.dev/api/gbif";
+const PETRIMAPS = "https://qlever.dev/petrimaps2/?backend=" +
+  encodeURIComponent(GBIF_BACKEND) + "&query=";
+const QLEVER_UI = "https://ui.qlever.dev/gbif?query=";
+const GBIF_SUGGEST = "https://api.gbif.org/v1/species/suggest";
+
+const taxonEl = document.getElementById("taxon");
+const countryEl = document.getElementById("country");
+const areaScopeEl = document.getElementById("areaScope");
+const geoScopeEl = document.getElementById("geoScope");
+const sugEl = document.getElementById("suggestions");
+const selEl = document.getElementById("selected");
+const goBtn = document.getElementById("go");
+const resultEl = document.getElementById("result");
+
+let selectedKey = null;
+let activeIdx = -1;
+let debounce;
+
+function buildQuery(taxonKey, country, areaScope, geoScope) {
+  const useCountry = geoScope === "country";
+  const useReserves = areaScope === "reserves";
+
+  const prefixes = [
+    'PREFIX gbifsp: <https://www.gbif.org/species/>',
+    'PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>',
+    'PREFIX dwciri: <http://rs.tdwg.org/dwc/iri/>',
+    'PREFIX wdt: <http://www.wikidata.org/prop/direct/>',
+  ];
+  if (useReserves) {
+    prefixes.unshift('PREFIX geo: <http://www.opengis.net/ont/geosparql#>');
+    prefixes.push(
+      'PREFIX geof: <http://www.opengis.net/def/function/geosparql/>',
+      'PREFIX osmkey: <https://www.openstreetmap.org/wiki/Key:>',
+      'PREFIX osm: <https://www.openstreetmap.org/>'
+    );
+  }
+
+  let occ = `  ?occurrence dwciri:toTaxon ?taxon ;
+              wdt:P625 ?geometry`;
+  occ += useCountry ? ` ;\n              dwc:countryCode "${country}" .` : ` .`;
+
+  const reserveBlock = useReserves ? `
+  SERVICE <https://qlever.dev/api/osm-planet> {
+    VALUES ?protect_class { "1a" "1" "1b" "2" "3" "4" "5" "6" "7" "97" "98" "99" }
+    ?reserve osmkey:protect_class ?protect_class ;
+             a osm:relation ;
+             geo:hasGeometry/geo:asWKT ?reserveGeometry .
+    FILTER (STRLEN(STR(?reserveGeometry)) < 1000000)
+  }
+  FILTER (geof:sfWithin(?geometry, ?reserveGeometry))` : ``;
+
+  return `${prefixes.join("\n")}
+SELECT ?occurrence ?date ?geometry WHERE {
+  VALUES ?taxon { gbifsp:${taxonKey} }
+${occ}
+  OPTIONAL { ?occurrence dwc:eventDate ?date }${reserveBlock}
+}`;
+}
+
+function clearSuggestions() {
+  sugEl.innerHTML = "";
+  activeIdx = -1;
+}
+
+async function fetchSuggestions(q) {
+  try {
+    const res = await fetch(`${GBIF_SUGGEST}?limit=8&q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    renderSuggestions(data || []);
+  } catch (e) {
+    clearSuggestions();
+  }
+}
+
+function renderSuggestions(list) {
+  if (!list.length) { clearSuggestions(); return; }
+  sugEl.innerHTML = list.map((s, i) => {
+    const name = s.canonicalName || s.scientificName || "";
+    const display = name.includes(" ") ? `<i>${name}</i>` : name;
+    const meta = [s.rank, s.kingdom].filter(Boolean).join(" · ");
+    return `<div class="suggestion" data-key="${s.key}" data-name="${name.replace(/"/g,'&quot;')}" data-idx="${i}">
+      ${display} <span style="color:var(--muted);font-size:12px">${meta}</span>
+    </div>`;
+  }).join("");
+}
+
+function selectSuggestion(el) {
+  selectedKey = el.getAttribute("data-key");
+  const name = el.getAttribute("data-name");
+  taxonEl.value = name;
+  const display = name.includes(" ") ? `<i>${name}</i>` : name;
+  selEl.innerHTML = `Selected: ${display} (GBIF ${selectedKey})`;
+  clearSuggestions();
+  goBtn.disabled = false;
+}
+
+taxonEl.addEventListener("input", () => {
+  selectedKey = null;
+  goBtn.disabled = true;
+  selEl.innerHTML = "";
+  const q = taxonEl.value.trim();
+  clearTimeout(debounce);
+  if (q.length < 3) { clearSuggestions(); return; }
+  debounce = setTimeout(() => fetchSuggestions(q), 220);
+});
+
+taxonEl.addEventListener("keydown", (e) => {
+  const items = [...sugEl.querySelectorAll(".suggestion")];
+  if (!items.length) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); activeIdx = (activeIdx + 1) % items.length; }
+  else if (e.key === "ArrowUp") { e.preventDefault(); activeIdx = (activeIdx - 1 + items.length) % items.length; }
+  else if (e.key === "Enter" && activeIdx >= 0) { e.preventDefault(); selectSuggestion(items[activeIdx]); return; }
+  else return;
+  items.forEach((it, i) => it.classList.toggle("active", i === activeIdx));
+});
+
+sugEl.addEventListener("click", (e) => {
+  const el = e.target.closest(".suggestion");
+  if (el) selectSuggestion(el);
+});
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".field")) clearSuggestions();
+});
+
+geoScopeEl.addEventListener("change", () => {
+  const byCountry = geoScopeEl.value === "country";
+  countryEl.disabled = !byCountry;
+  countryEl.required = byCountry;
+});
+
+document.getElementById("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const areaScope = areaScopeEl.value;
+  const geoScope = geoScopeEl.value;
+  const country = countryEl.value.trim().toUpperCase();
+  if (!selectedKey) return;
+  if (geoScope === "country" && !/^[A-Z]{2}$/.test(country)) return;
+  const query = buildQuery(selectedKey, country, areaScope, geoScope);
+  const mapUrl = PETRIMAPS + encodeURIComponent(query);
+  const qleverUrl = QLEVER_UI + encodeURIComponent(query);
+  resultEl.innerHTML = `<div class="toolbar">
+      <span>Result:</span>
+      <a href="${qleverUrl}" target="_blank" rel="noopener">Open query in QLever ↗</a>
+      <a href="${mapUrl}" target="_blank" rel="noopener">Open map in new tab ↗</a>
+    </div>
+    <iframe id="frame" src="${mapUrl}" title="Occurrence map"></iframe>`;
+});
+</script>
+</body>
+</html>
