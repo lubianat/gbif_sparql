@@ -1,6 +1,10 @@
 # Species occurrences in nature reserves
 
 A minimal web tool to explore GBIF species occurrence data spatially filtered to protected areas, powered by a live SPARQL endpoint.
+<img width="1187" height="873" alt="grafik" src="https://github.com/user-attachments/assets/9f7f67a8-0c80-402f-8bd8-9936df06c1cc" />
+
+https://youtu.be/vKqK2SePcXY
+
 
 ## What it does
 
