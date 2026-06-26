@@ -48,6 +48,8 @@
   <p class="sub">Search for a taxon, pick a country or the whole world, and optionally restrict to protected areas —
   then explore GBIF occurrences overlaid on OpenStreetMap reserve boundaries. </p>
     <p class="sub">
+  Taxon lookup is powered by the <a href="https://www.wikidata.org/" target="_blank" rel="noopener">Wikidata API</a>
+  (matching items with a GBIF ID statement, property P846).
   GBIF data is converted to RDF via <a href="https://github.com/Micelio/gbif_parquet" target="_blank" rel="noopener">gbif_parquet</a>
   and queried live on <a href="https://ui.qlever.dev/gbif" target="_blank" rel="noopener">QLever</a>.
   </p><p class="sub">
@@ -61,7 +63,7 @@
 
 <form id="form" autocomplete="off">
   <div class="field">
-    <label for="taxon">Taxon (GBIF)</label>
+    <label for="taxon">Taxon (via Wikidata → GBIF)</label>
     <input id="taxon" type="text" placeholder="e.g. Leucaena leucocephala" required>
     <div id="suggestions" class="suggestions"></div>
   </div>
@@ -96,7 +98,11 @@ const GBIF_BACKEND = "https://qlever.dev/api/gbif";
 const PETRIMAPS = "https://qlever.dev/petrimaps2/?backend=" +
   encodeURIComponent(GBIF_BACKEND) + "&query=";
 const QLEVER_UI = "https://ui.qlever.dev/gbif?query=";
-const GBIF_SUGGEST = "https://api.gbif.org/v1/species/suggest";
+
+const WIKIDATA_API = "https://www.wikidata.org/w/api.php";
+const WMF_API_HEADERS = {
+  'Api-User-Agent': 'gbif_sparql/0.1 (https://github.com/lubianat/gbif_sparql)'
+};
 
 const taxonEl = document.getElementById("taxon");
 const countryEl = document.getElementById("country");
@@ -157,11 +163,44 @@ function clearSuggestions() {
   activeIdx = -1;
 }
 
+// --- Wikidata-based taxon lookup, retrieving P225 (taxon name) and P846 (GBIF ID) ---
 async function fetchSuggestions(q) {
   try {
-    const res = await fetch(`${GBIF_SUGGEST}?limit=8&q=${encodeURIComponent(q)}`);
-    const data = await res.json();
-    renderSuggestions(data || []);
+    // 1) Search Wikidata for entities that carry a GBIF ID (P846) statement and match the query.
+    const searchUrl = `${WIKIDATA_API}?action=query&format=json&list=search&formatversion=2` +
+      `&srsearch=${encodeURIComponent(`haswbstatement:"P846" ${q}`)}&srlimit=8&origin=*`;
+    const searchRes = await fetch(searchUrl, { headers: WMF_API_HEADERS });
+    const searchData = (await searchRes.json()).query;
+
+    if (!searchData || !searchData.search || !searchData.search.length) {
+      clearSuggestions();
+      return;
+    }
+
+    // 2) Fetch claims for the matched QIDs to extract P225 (taxon name) and P846 (GBIF ID).
+    const qids = searchData.search.map(item => item.title);
+    const detailsUrl = `${WIKIDATA_API}?action=wbgetentities&ids=${qids.join("|")}` +
+      `&props=claims&format=json&origin=*`;
+    const detailsRes = await fetch(detailsUrl, { headers: WMF_API_HEADERS });
+    const detailsData = await detailsRes.json();
+
+    const list = searchData.search.map(item => {
+      const qid = item.title;
+      let taxonName = item.label || "";
+      let gbifId = null;
+      const ent = detailsData.entities && detailsData.entities[qid];
+      if (ent && ent.claims) {
+        if (ent.claims.P225 && ent.claims.P225.length) {
+          taxonName = ent.claims.P225[0].mainsnak.datavalue.value;
+        }
+        if (ent.claims.P846 && ent.claims.P846.length) {
+          gbifId = ent.claims.P846[0].mainsnak.datavalue.value;
+        }
+      }
+      return { qid, taxonName, gbifId };
+    }).filter(s => s.gbifId); // only keep items that resolve to a GBIF ID
+
+    renderSuggestions(list);
   } catch (e) {
     clearSuggestions();
   }
@@ -170,10 +209,10 @@ async function fetchSuggestions(q) {
 function renderSuggestions(list) {
   if (!list.length) { clearSuggestions(); return; }
   sugEl.innerHTML = list.map((s, i) => {
-    const name = s.canonicalName || s.scientificName || "";
+    const name = s.taxonName || "";
     const display = name.includes(" ") ? `<i>${name}</i>` : name;
-    const meta = [s.rank, s.kingdom].filter(Boolean).join(" · ");
-    return `<div class="suggestion" data-key="${s.key}" data-name="${name.replace(/"/g,'&quot;')}" data-idx="${i}">
+    const meta = `GBIF ${s.gbifId} · ${s.qid}`;
+    return `<div class="suggestion" data-key="${s.gbifId}" data-name="${name.replace(/"/g,'&quot;')}" data-idx="${i}">
       ${display} <span style="color:var(--muted);font-size:12px">${meta}</span>
     </div>`;
   }).join("");
